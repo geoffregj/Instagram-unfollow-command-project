@@ -1,0 +1,614 @@
+"""
+Instagram Analyzer & Auto-Unfollower — hunter15.py
+===================================================
+Key fix: fetches YOUR OWN following list directly from Instagram
+(which includes numeric IDs for free) instead of looking up
+each username individually. This avoids all the rate limiting
+on user ID lookups.
+
+Requirements:
+    pip install requests
+"""
+
+from html.parser import HTMLParser
+import os, glob, sys, json, time, random, re
+from datetime import datetime
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+SESSION_FILE  = "ig_session.json"
+RESULTS_FILE  = "instagram_results.json"
+LOG_FILE      = "unfollow_log.json"
+ID_CACHE_FILE = "id_cache.json"
+
+WEB_HEADERS = {
+    "User-Agent"      : "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Accept"          : "*/*",
+    "Accept-Language" : "en-US,en;q=0.9",
+    "Accept-Encoding" : "gzip, deflate, br",
+    "X-IG-App-ID"     : "936619743392459",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer"         : "https://www.instagram.com/accounts/login/",
+    "Origin"          : "https://www.instagram.com",
+    "Connection"      : "keep-alive",
+}
+
+API_HEADERS = {
+    "User-Agent"      : "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Accept"          : "*/*",
+    "Accept-Language" : "en-US,en;q=0.9",
+    "X-IG-App-ID"     : "936619743392459",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer"         : "https://www.instagram.com/",
+    "Origin"          : "https://www.instagram.com",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HTML PARSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+class InstagramDataParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.usernames: set[str] = set()
+        self._in_link = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        href = dict(attrs).get("href", "")
+        if "instagram.com/" in href and not any(
+            s in href for s in ("/explore/", "/reels/", "/p/", "/stories/", "/tv/")
+        ):
+            self._in_link = True
+
+    def handle_data(self, data):
+        if not self._in_link:
+            return
+        u = data.strip()
+        if "instagram.com" in u:
+            u = u.rstrip("/").split("/")[-1]
+        if u and 1 <= len(u) <= 30:
+            self.usernames.add(u.lower())
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._in_link = False
+
+
+def extract_usernames(path):
+    if not os.path.exists(path):
+        return set()
+    p = InstagramDataParser()
+    with open(path, "r", encoding="utf-8") as f:
+        p.feed(f.read())
+    return p.usernames
+
+
+def load_export_data():
+    print("\n🔍  Scanning for Instagram data export files...")
+    following = extract_usernames("following.html")
+    if not following:
+        sys.exit("❌  following.html not found or empty.")
+    files = sorted(glob.glob("followers_*.html"))
+    if not files:
+        sys.exit("❌  No followers_*.html files found.")
+    followers = set()
+    for f in files:
+        batch = extract_usernames(f)
+        followers.update(batch)
+        print(f"   ✔  {f}  →  {len(batch)} followers")
+    return following, followers
+
+
+def analyse(following, followers):
+    return {
+        "not_following_back": sorted(following - followers),
+        "you_dont_follow"   : sorted(followers - following),
+        "mutual"            : sorted(following & followers),
+    }
+
+
+def print_report(following, followers, res):
+    nfb = res["not_following_back"]
+    ydf = res["you_dont_follow"]
+    mu  = res["mutual"]
+    w   = 50
+    print(f"\n{'═'*w}")
+    print(f"  📊  Follower Report  —  {datetime.now():%Y-%m-%d %H:%M}")
+    print(f"{'═'*w}")
+    print(f"  You follow          : {len(following):>5}")
+    print(f"  Follow you          : {len(followers):>5}")
+    print(f"  Mutual              : {len(mu):>5}")
+    print(f"{'─'*w}")
+    print(f"\n❌  Not following you back ({len(nfb)}):")
+    for u in nfb:
+        print(f"    - {u}")
+    if not nfb:
+        print("    None! 🎉")
+    print(f"\n⭐  Follow you / you don't follow back ({len(ydf)}):")
+    for u in ydf:
+        print(f"    - {u}")
+    if not ydf:
+        print("    None!")
+    with open(RESULTS_FILE, "w") as f:
+        json.dump({
+            "generated_at"      : datetime.now().isoformat(),
+            "not_following_back": nfb,
+            "you_dont_follow"   : ydf,
+            "mutual"            : mu,
+        }, f, indent=2)
+    print(f"\n💾  Saved to {RESULTS_FILE}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SESSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_session(data):
+    with open(SESSION_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"   ✔  Session saved to {SESSION_FILE}")
+
+
+def load_session():
+    if not os.path.exists(SESSION_FILE):
+        return None
+    with open(SESSION_FILE) as f:
+        return json.load(f)
+
+
+def restore_session(saved):
+    s = requests.Session()
+    s.headers.update(API_HEADERS)
+    s.headers["X-CSRFToken"] = saved["csrftoken"]
+    s.cookies.set("sessionid",  saved["sessionid"],  domain=".instagram.com")
+    s.cookies.set("csrftoken",  saved["csrftoken"],   domain=".instagram.com")
+    s.cookies.set("ds_user_id", saved["user_id"],     domain=".instagram.com")
+    return s
+
+
+def verify_session(session):
+    try:
+        r = session.get(
+            "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
+            timeout=10
+        )
+        return r.status_code == 200 and "user" in r.text
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOGIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def login_web(username, password):
+    print(f"\n🔐  Logging in as @{username}...")
+    s = requests.Session()
+    s.headers.update(WEB_HEADERS)
+
+    print("   ⏳  Step 1/2: Loading login page...")
+    try:
+        r    = s.get("https://www.instagram.com/accounts/login/", timeout=15)
+        csrf = s.cookies.get("csrftoken", "")
+        if not csrf:
+            m    = re.search(r'"csrf_token":"([^"]+)"', r.text)
+            csrf = m.group(1) if m else ""
+        if not csrf:
+            print("   ⚠  Could not get CSRF token")
+            return None
+        print("   ✔  Got CSRF token")
+    except Exception as e:
+        print(f"   ✘  Failed: {e}")
+        return None
+
+    time.sleep(random.uniform(2, 4))
+    print("   ⏳  Step 2/2: Submitting credentials...")
+    s.headers["X-CSRFToken"] = csrf
+
+    payload = {
+        "username"            : username,
+        "enc_password"        : f"#PWD_INSTAGRAM_BROWSER:0:{int(time.time())}:{password}",
+        "queryParams"         : "{}",
+        "optIntoOneTap"       : "false",
+        "stopDeletionNonce"   : "",
+        "trustedDeviceRecords": "{}",
+    }
+
+    try:
+        r = s.post(
+            "https://www.instagram.com/api/v1/web/accounts/login/ajax/",
+            data=payload, timeout=20,
+        )
+    except Exception as e:
+        print(f"   ✘  Request failed: {e}")
+        return None
+
+    print(f"   ✔  Server responded: HTTP {r.status_code}")
+
+    if not r.text.strip():
+        print("   ✘  Empty response — try turning off VPN.")
+        return None
+
+    try:
+        data = r.json()
+    except Exception:
+        print(f"   ✘  Unexpected response: {r.text[:200]}")
+        return None
+
+    if data.get("checkpoint_url") or "checkpoint" in str(data):
+        checkpoint_url = data.get("checkpoint_url", "")
+        full = f"https://www.instagram.com{checkpoint_url}" if checkpoint_url.startswith("/") else checkpoint_url
+        print(f"\n   🔒  Verification required!")
+        print(f"      Open this URL and complete verification:")
+        print(f"\n      {full}\n")
+        input("      Press Enter AFTER completing verification... ")
+        time.sleep(3)
+        # retry
+        try:
+            r2   = s.post(
+                "https://www.instagram.com/api/v1/web/accounts/login/ajax/",
+                data=payload, timeout=20,
+            )
+            data = r2.json()
+        except Exception:
+            pass
+
+    if data.get("two_factor_required"):
+        info       = data.get("two_factor_info", {})
+        identifier = info.get("two_factor_identifier", "")
+        code       = input("   Enter 2FA code: ").strip().replace(" ", "")
+        s.headers["X-CSRFToken"] = csrf
+        r2   = s.post(
+            "https://www.instagram.com/api/v1/web/accounts/login/ajax/two_factor/",
+            data={"username": username, "verificationCode": code,
+                  "two_factor_identifier": identifier, "queryParams": "{}"},
+            timeout=20,
+        )
+        data = r2.json()
+
+    if data.get("authenticated"):
+        sessionid = s.cookies.get("sessionid", "")
+        csrftoken = s.cookies.get("csrftoken", csrf)
+        user_id   = data.get("userId", "")
+        save_session({"username": username, "user_id": str(user_id),
+                      "sessionid": sessionid, "csrftoken": csrftoken})
+        s.headers.update(API_HEADERS)
+        s.headers["X-CSRFToken"] = csrftoken
+        print(f"   ✔  Login successful! user_id={user_id}")
+        return s
+
+    msg = data.get("message", "")
+    if data.get("user") is False:
+        print("   ✘  Username not found.")
+    elif data.get("authenticated") is False:
+        print("   ✘  Wrong password.")
+    else:
+        print(f"   ✘  Login failed: {data}")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE KEY FIX: fetch YOUR following list with IDs already included
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_following_with_ids(session, user_id, targets_set):
+    """
+    Fetches your complete following list from Instagram's API.
+    Each entry includes the numeric user ID — no per-user lookup needed.
+    Returns dict: {username: numeric_id} for everyone in targets_set.
+    """
+    print(f"\n📥  Fetching your following list from Instagram to get user IDs...")
+    print(f"    (This is one API call per page of ~200 users — much less rate-limited)\n")
+
+    id_map    = {}
+    next_page = None
+    page      = 1
+
+    while True:
+        url = f"https://www.instagram.com/api/v1/friendships/{user_id}/following/?count=200"
+        if next_page:
+            url += f"&max_id={next_page}"
+
+        try:
+            r = session.get(url, timeout=20)
+        except Exception as e:
+            print(f"   ⚠  Network error on page {page}: {e}")
+            break
+
+        if r.status_code == 429:
+            print(f"   ⚠  Rate limited fetching following list — waiting 60s...")
+            time.sleep(60)
+            continue
+
+        if r.status_code != 200:
+            print(f"   ⚠  Unexpected status {r.status_code} on page {page}")
+            break
+
+        try:
+            data  = r.json()
+            users = data.get("users", [])
+        except Exception:
+            print(f"   ⚠  Could not parse response on page {page}")
+            break
+
+        found_this_page = 0
+        for user in users:
+            uname = (user.get("username") or "").lower()
+            uid   = str(user.get("pk") or user.get("id") or "")
+            if uname and uid:
+                # Save ALL IDs to cache
+                id_map[uname] = uid
+                if uname in targets_set:
+                    found_this_page += 1
+
+        print(f"   Page {page}: {len(users)} accounts scanned, "
+              f"{found_this_page} targets found")
+
+        # Save full cache to disk
+        existing = {}
+        if os.path.exists(ID_CACHE_FILE):
+            try:
+                with open(ID_CACHE_FILE) as f:
+                    existing = json.load(f)
+            except Exception:
+                pass
+        existing.update(id_map)
+        with open(ID_CACHE_FILE, "w") as f:
+            json.dump(existing, f)
+
+        # Check for next page
+        next_page = data.get("next_max_id")
+        if not next_page or not users:
+            break
+
+        page += 1
+        time.sleep(random.uniform(3, 6))   # polite pause between pages
+
+    # Filter to only targets we care about
+    result = {u: id_map[u] for u in targets_set if u in id_map}
+    print(f"\n   ✔  Found IDs for {len(result)} of {len(targets_set)} targets")
+
+    missing = len(targets_set) - len(result)
+    if missing > 0:
+        print(f"   ⚠  {missing} targets not found in following list")
+        print(f"      (they may have already been unfollowed or deactivated)")
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UNFOLLOW
+# ══════════════════════════════════════════════════════════════════════════════
+
+def unfollow_by_id(session, user_id):
+    try:
+        r = session.post(
+            f"https://www.instagram.com/api/v1/friendships/destroy/{user_id}/",
+            data={"user_id": user_id},
+            timeout=15,
+        )
+        if r.status_code == 429:
+            return "rate_limited"
+        if r.status_code == 200:
+            return "ok"
+        return "error"
+    except Exception:
+        return "error"
+
+
+def run_unfollow(targets, session, user_id, max_batch=20,
+                 delay_min=40.0, delay_max=80.0):
+
+    log        = []
+    unfollowed = skipped = errors = 0
+    consecutive_rl = 0
+
+    # ── Get all IDs in one go from the following list ──────────────────────
+    targets_set = set(targets[:max_batch])
+
+    # Load cache first
+    cached_ids = {}
+    if os.path.exists(ID_CACHE_FILE):
+        try:
+            with open(ID_CACHE_FILE) as f:
+                cached_ids = json.load(f)
+        except Exception:
+            pass
+
+    # Check how many we already have cached
+    already_cached = {u: cached_ids[u] for u in targets_set if u in cached_ids}
+    need_lookup    = targets_set - set(already_cached.keys())
+
+    print(f"\n   📦  {len(already_cached)} IDs already cached")
+
+    if need_lookup:
+        # Fetch the following list to get remaining IDs
+        fetched = fetch_following_with_ids(session, user_id, need_lookup)
+        all_ids = {**already_cached, **fetched}
+    else:
+        all_ids = already_cached
+        print(f"   ✔  All IDs cached — skipping following list fetch\n")
+
+    # ── Natural warmup ─────────────────────────────────────────────────────
+    print("\n   ⏳  Brief warmup before unfollowing (15s)...")
+    time.sleep(15)
+
+    total = len([u for u in targets[:max_batch] if u in all_ids])
+    print(f"\n🚀  Unfollow session started")
+    print(f"    Ready to unfollow : {total}")
+    print(f"    Delay             : {delay_min:.0f}–{delay_max:.0f}s between each")
+    print(f"    Est.              : ~{int(total * (delay_min + delay_max) / 2 / 60)} min\n")
+
+    for i, username in enumerate(targets[:max_batch]):
+        uid = all_ids.get(username)
+
+        if not uid:
+            print(f"  [-]  @{username}  ⚠  No ID found — already unfollowed or deactivated, skipping")
+            skipped += 1
+            log.append({"username": username, "status": "no_id",
+                        "timestamp": datetime.now().isoformat()})
+            continue
+
+        print(f"  [{unfollowed+1}/{total}]  @{username}", end="  ", flush=True)
+        result = unfollow_by_id(session, uid)
+
+        if result == "ok":
+            print("✔  Unfollowed")
+            unfollowed += 1
+            consecutive_rl = 0
+            log.append({"username": username, "uid": uid, "status": "unfollowed",
+                        "timestamp": datetime.now().isoformat()})
+
+        elif result == "rate_limited":
+            consecutive_rl += 1
+            print(f"⚠  Rate limited ({consecutive_rl} in a row)")
+            log.append({"username": username, "status": "rate_limited",
+                        "timestamp": datetime.now().isoformat()})
+            if consecutive_rl >= 3:
+                print(f"\n   🛑  Instagram throttling too hard. Stopping.")
+                print(f"      Wait 30+ minutes then run again (use saved session).")
+                break
+            wait = 90 * consecutive_rl
+            print(f"      Waiting {wait}s...")
+            time.sleep(wait)
+            continue
+
+        else:
+            print("✘  Failed")
+            errors += 1
+            log.append({"username": username, "uid": uid, "status": "error",
+                        "timestamp": datetime.now().isoformat()})
+
+        # Delay between unfollows
+        if unfollowed < total:
+            delay = random.uniform(delay_min, delay_max)
+            print(f"      ⏳  Waiting {delay:.1f}s...")
+            time.sleep(delay)
+
+    # Save log
+    existing = []
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE) as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+    existing.extend(log)
+    with open(LOG_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    print(f"\n{'─'*50}")
+    print(f"  ✔  Unfollowed : {unfollowed}")
+    print(f"  ⚠  Skipped    : {skipped}")
+    print(f"  ✘  Errors     : {errors}")
+    print(f"  📄 Log        : {LOG_FILE}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("╔══════════════════════════════════════════╗")
+    print("║   Instagram Analyzer — hunter15.py       ║")
+    print("║   Bulk ID fetch · No per-user lookups    ║")
+    print("╚══════════════════════════════════════════╝")
+    print("""
+  [1] Parse export files only
+  [2] Auto-unfollow (uses saved session)
+  [3] Parse + auto-unfollow in one go
+  [4] Clear saved session
+""")
+    choice = input("  Choice [1-4]: ").strip()
+
+    if choice == "4":
+        for f in [SESSION_FILE, ID_CACHE_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+                print(f"   ✔  Deleted {f}")
+        return
+
+    if choice in ("1", "3"):
+        following, followers = load_export_data()
+        res     = analyse(following, followers)
+        print_report(following, followers, res)
+        targets = res["not_following_back"]
+    elif choice == "2":
+        if not os.path.exists(RESULTS_FILE):
+            sys.exit(f"❌  Run option 1 first.")
+        with open(RESULTS_FILE) as f:
+            targets = json.load(f)["not_following_back"]
+        print(f"\n📂  Loaded {len(targets)} targets from {RESULTS_FILE}")
+    else:
+        print("Invalid choice.")
+        return
+
+    if choice == "1":
+        return
+
+    if not REQUESTS_AVAILABLE:
+        sys.exit("❌  Run: pip install requests")
+
+    if not targets:
+        print("\n🎉  No one to unfollow!")
+        return
+
+    # Login / restore session
+    session  = None
+    saved    = load_session()
+
+    if saved:
+        print(f"\n✔  Found saved session for @{saved.get('username','?')}")
+        reuse = input("   Use saved session? [Y/n]: ").strip().lower()
+        if reuse != "n":
+            session = restore_session(saved)
+            print("   🔍  Verifying session...", end=" ", flush=True)
+            if verify_session(session):
+                print("✔  Valid!")
+            else:
+                print("✘  Expired.")
+                session = None
+
+    if session is None:
+        username = input("\n   Instagram username: ").strip()
+        password = input("   Instagram password: ").strip()
+        session  = login_web(username, password)
+        if session is None:
+            sys.exit("❌  Login failed.")
+        saved = load_session()
+
+    user_id = saved.get("user_id") if saved else None
+    if not user_id:
+        sys.exit("❌  Could not get user ID from session.")
+
+    print(f"\n   {len(targets)} accounts to unfollow.")
+    raw = input("   How many this session? (default 20, safe max ~30): ").strip()
+    try:
+        batch = max(1, min(int(raw), 200)) if raw else 20
+    except ValueError:
+        batch = 20
+
+    confirm = input(f"\n⚠  Unfollow {batch} accounts? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("   Cancelled.")
+        return
+
+    run_unfollow(targets, session, user_id, max_batch=batch)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⛔  Interrupted.")
